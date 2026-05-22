@@ -25,10 +25,13 @@ model = pulp.LpProblem("EduSched_Problem", pulp.LpMinimize)
 
 X = pulp.LpVariable.dicts("Assign", (I, J, R), cat=pulp.LpBinary)
 
-#Soft Constraints
+# thêm workload balance trong soft constraints
+# =====================================================================
+# Soft Constraints (Ràng buộc mềm)
+# =====================================================================
 
-#a. Một người không trực hai ca liên tiếp nhau bất kể cơ sở
-#Xác định hai ca liên tiếp là những cặp nào
+# a. Một người không trực hai ca liên tiếp nhau bất kể cơ sở
+# Xác định hai ca liên tiếp là những cặp nào
 consecutive_pairs = []
 for d in dates:
     shifts_today = [j for j in J if Date_j[j] == d]
@@ -38,20 +41,40 @@ for d in dates:
 
 Y_fatigue = pulp.LpVariable.dicts("Fatigue", ((i, pair) for i in I for pair in consecutive_pairs), cat=pulp.LpBinary)
 
-# +1 nếu cơ sở được phân không gần staff
-travel_pen = pulp.lpSum(X[i][j] for i in I for j in J for r in R if L_j[j] != 'Chưa xác định' and P_ic[i] != 'Neutral' and P_ic[i] != L_j[j])
-
 # +1 nếu có staff làm hai ca liên tục bất kể cơ sở
 fatigue_pen = pulp.lpSum(Y_fatigue[(i, pair)] for i in I for pair in consecutive_pairs)
 
-#Xác định trọng số của các soft constraints (cái nào quan trọng hơn)
+# b. +1 nếu cơ sở được phân không gần staff (Đã sửa lỗi X[i][j] thành X[i][j][r])
+travel_pen = pulp.lpSum(X[i][j][r] for i in I for j in J for r in R if L_j[j] != 'Chưa xác định' and P_ic[i] != 'Neutral' and P_ic[i] != L_j[j])
+
+# c. Cân bằng khối lượng công việc (Workload Fairness)
+# Khai báo biến dư (d_plus) và thiếu (d_minus) cho từng người
+d_plus = pulp.LpVariable.dicts("d_plus", I, lowBound=0, cat=pulp.LpContinuous)
+d_minus = pulp.LpVariable.dicts("d_minus", I, lowBound=0, cat=pulp.LpContinuous)
+
+# Tính mức gác ca lý tưởng trung bình (Tổng số nhân sự cần / Tổng số cán bộ)
+ideal_workload = sum(R_j.values()) / len(I)
+
+# Thêm phương trình cân bằng cho từng giám thị
+for i in I:
+    total_worked = pulp.lpSum(X[i][j][r] for j in J for r in R)
+    model += total_worked + d_minus[i] - d_plus[i] == ideal_workload
+
+# Tổng điểm phạt chênh lệch khối lượng công việc
+workload_pen = pulp.lpSum(d_plus[i] + d_minus[i] for i in I)
+
+# Xác định trọng số của các soft constraints (cái nào quan trọng hơn)
 WEIGHT_TRAVEL = 2
 WEIGHT_FATIGUE = 5
+WEIGHT_WORKLOAD = 15 # Đặt trọng số cao nhất để ưu tiên san sẻ công bằng
 
-#Vì mục tiêu của hàm là minimize cho nên sẽ cố gắng đạt giá trị gần 0 nhất có thể
-model += (WEIGHT_TRAVEL * travel_pen) + (WEIGHT_FATIGUE * fatigue_pen)
+# Vì mục tiêu của hàm là minimize cho nên sẽ cố gắng đạt giá trị gần 0 nhất có thể
+model += (WEIGHT_TRAVEL * travel_pen) + (WEIGHT_FATIGUE * fatigue_pen) + (WEIGHT_WORKLOAD * workload_pen)
 
-#Hard Constraints
+
+# =====================================================================
+# Hard Constraints
+# =====================================================================
 
 # a. Đảm bảo đủ số lượng cán bộ cho mỗi ca thi (update)
 for j in J:
@@ -117,28 +140,66 @@ for i in I:
         worked_B = pulp.lpSum(X[i][shift_B][r] for r in R)
         model += Y_fatigue[(i, pair)] >= worked_A + worked_B - 1
 
+
+# sửa format file output 
+
 status = model.solve()
-print(f"Final Status: {pulp.LpStatus[status]}")
+print(f"\nFinal Status: {pulp.LpStatus[status]}")
 
 if pulp.LpStatus[status] == 'Optimal':
     print(f"Total Penalty Score: {pulp.value(model.objective)}")
+    
     sched = []
+    
+    # Tạo từ điển dịch Thứ sang Tiếng Việt
+    weekday_map = {
+        'Monday': 'Thứ 2', 'Tuesday': 'Thứ 3', 'Wednesday': 'Thứ 4', 
+        'Thursday': 'Thứ 5', 'Friday': 'Thứ 6', 'Saturday': 'Thứ 7', 'Sunday': 'Chủ nhật'
+    }
+
     for i in I:
         for j in J:
             for r in R:
                 if pulp.value(X[i][j][r]) == 1:
+                    # 1. Xử lý cột Thứ sang Tiếng Việt
+                    eng_day = pd.to_datetime(Date_j[j]).strftime('%A')
+                    vie_day = weekday_map[eng_day]
+                    
+                    # 2. Xử lý cột Ca thi chi tiết
+                    date_obj = pd.to_datetime(Date_j[j])
+                    date_str = date_obj.strftime('%d/%m/%Y')
+                    ca_number = str(j).split('_')[-1] 
+                    
+                    start_time_str = T_j[j].replace('g', ':')
+                    end_time_obj = pd.to_datetime(start_time_str, format='%H:%M') + pd.Timedelta(minutes=Duration_j[j])
+                    end_time_str = end_time_obj.strftime('%Hg%M')
+                    
+                    full_cathi_name = f"{vie_day}, {date_str}, Ca {ca_number}: {T_j[j]}-{end_time_str}"
+
                     sched.append({
-                        "MS của CÁN BỘ COI THI": i,
-                        "MS Ca thi": j,
-                        "Nhiệm vụ": r,
+                        "Ca thi": full_cathi_name,
                         "Ngày": Date_j[j],
                         "GIỜ": T_j[j],
+                        "MS Ca thi": j,
+                        "Nhiệm vụ": r,
+                        "MS của CÁN BỘ COI THI": i,
+                        "Thời gian": Duration_j[j],
+                        "Thứ": vie_day,
                         "Cơ sở": L_j[j]
                     })
+                    
+    output_df = pd.DataFrame(sched)
+    output_df = output_df.sort_values(by=['Ngày', 'GIỜ', 'MS Ca thi'])
     
-    final_df = pd.DataFrame(sched)
-    final_df = final_df.sort_values(by=["Ngày", "GIỜ", "MS Ca thi"])
-    final_df.to_csv("Output.csv", index=False, encoding='utf-8-sig')
+    columns_order = [
+        "Ca thi", "Ngày", "GIỜ", "MS Ca thi", "Nhiệm vụ", 
+        "MS của CÁN BỘ COI THI", "Thời gian", "Thứ", "Cơ sở"
+    ]
+    output_df = output_df[columns_order]
+    
+    output_df.to_csv('Output.csv', index=False, encoding='utf-8-sig')
+    print("Đã xuất file kết quả: Output.csv")
+
 else:
-    print("Unable to solve")
+    print("Unable to solve - Mô hình bị vô nghiệm.")
         
