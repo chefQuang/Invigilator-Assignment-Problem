@@ -26,7 +26,7 @@ def process_and_export_data(csv_filepath, output_json_path):
 
 
     #Randomly assign a location preference to each staff member
-    preferences = ["CS1", "CS2", "Neutral"]
+    preferences = ["Cơ sở 1", "Cơ sở 2", "Neutral"]
     staff_pref = {}
     for staff in invigilators:
         staff_pref[staff] = random.choice(preferences)

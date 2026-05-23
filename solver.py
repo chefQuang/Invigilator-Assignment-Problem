@@ -1,6 +1,7 @@
 import json
 import pulp
 import pandas as pd
+import numpy as np
 
 with open('processed_data.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
@@ -78,7 +79,7 @@ model += (WEIGHT_TRAVEL * travel_pen) + (WEIGHT_FATIGUE * fatigue_pen) + (WEIGHT
 
 # a. Đảm bảo đủ số lượng cán bộ cho mỗi ca thi (update)
 for j in J:
-    model += pulp.lpSum(X[i][j] for i in I) == R_j[j]
+    model += pulp.lpSum(X[i][j][r] for i in I for r in R) == R_j[j]
     campus = L_j[j]
     if campus == 'Cơ sở 1':
         role_cap = 'LTK_Trưởng HĐ'
@@ -203,3 +204,168 @@ if pulp.LpStatus[status] == 'Optimal':
 else:
     print("Unable to solve - Mô hình bị vô nghiệm.")
         
+
+#Performance evaluation
+BASELINE_CSV = 'IAPDataset.csv'
+OPTIMIZED_CSV = 'Output.csv'
+PROCESSED_JSON = 'processed_data.json'
+STAFF_COL = 'MS của CÁN BỘ COI THI'
+
+
+def load_preferences(json_path):
+    """Load staff campus preferences from processed_data.json."""
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data['parameters']['staff_pref']
+
+
+def compute_consecutive_pairs(df):
+    """
+    Replicate the solver's logic for identifying consecutive shift pairs.
+    For each date, sort shifts by MS Ca thi and pair adjacent ones.
+    """
+    pairs = []
+    for date, group in df.groupby('Ngày'):
+        shifts_today = sorted(group['MS Ca thi'].unique())
+        for k in range(len(shifts_today) - 1):
+            pairs.append((shifts_today[k], shifts_today[k + 1]))
+    return pairs
+
+
+def evaluate_schedule(filepath, staff_pref, label):
+    """Compute all 9 metrics for a given schedule CSV."""
+    df = pd.read_csv(filepath, encoding='utf-8-sig')
+    df['Cơ sở'] = df['Cơ sở'].fillna('Chưa xác định')
+
+    results = {}
+
+    # -----------------------------------------------------------------
+    # 1. Total number of assigned duties
+    # -----------------------------------------------------------------
+    results['total_duties'] = len(df)
+
+    # -----------------------------------------------------------------
+    # 2-4. Workload metrics
+    # -----------------------------------------------------------------
+    workloads = df[STAFF_COL].value_counts()
+    all_staff = list(staff_pref.keys())
+    # Include staff with 0 assignments
+    workloads = workloads.reindex(all_staff, fill_value=0)
+
+    results['max_workload'] = int(workloads.max())
+    results['min_workload'] = int(workloads.min())
+
+    ideal_workload = results['total_duties'] / len(all_staff)
+    results['ideal_workload'] = ideal_workload
+    results['mad_workload'] = float(np.mean(np.abs(workloads - ideal_workload)))
+
+    # -----------------------------------------------------------------
+    # 5. Number of simultaneous-shift conflicts
+    #    (same person, same date, same time slot → assigned to >1 shift)
+    # -----------------------------------------------------------------
+    simultaneous = df.groupby([STAFF_COL, 'Ngày', 'GIỜ']).size()
+    results['simultaneous_conflicts'] = int((simultaneous > 1).sum())
+
+    # -----------------------------------------------------------------
+    # 6. Number of cross-campus consecutive conflicts
+    #    Same person assigned to two consecutive shifts on different campuses
+    # -----------------------------------------------------------------
+    consecutive_pairs = compute_consecutive_pairs(df)
+    shift_campus = df.drop_duplicates('MS Ca thi').set_index('MS Ca thi')['Cơ sở'].to_dict()
+
+    cross_campus_count = 0
+    for (s1, s2) in consecutive_pairs:
+        c1 = shift_campus.get(s1, 'Chưa xác định')
+        c2 = shift_campus.get(s2, 'Chưa xác định')
+        if c1 == 'Chưa xác định' or c2 == 'Chưa xác định' or c1 == c2:
+            continue
+        staff_s1 = set(df[df['MS Ca thi'] == s1][STAFF_COL])
+        staff_s2 = set(df[df['MS Ca thi'] == s2][STAFF_COL])
+        cross_campus_count += len(staff_s1 & staff_s2)
+
+    results['cross_campus_conflicts'] = cross_campus_count
+
+    # -----------------------------------------------------------------
+    # 7. Total fatigue penalty
+    #    Count how many (person, consecutive-pair) have both shifts assigned
+    # -----------------------------------------------------------------
+    fatigue_count = 0
+    for (s1, s2) in consecutive_pairs:
+        staff_s1 = set(df[df['MS Ca thi'] == s1][STAFF_COL])
+        staff_s2 = set(df[df['MS Ca thi'] == s2][STAFF_COL])
+        fatigue_count += len(staff_s1 & staff_s2)
+
+    results['fatigue_penalty'] = fatigue_count
+
+    # -----------------------------------------------------------------
+    # 8. Total travel preference penalty
+    #    Count assignments where campus ≠ staff preference (excluding
+    #    Neutral preference and unknown campus), matching solver logic
+    # -----------------------------------------------------------------
+    travel_count = 0
+    for _, row in df.iterrows():
+        campus = row['Cơ sở']
+        staff = row[STAFF_COL]
+        pref = staff_pref.get(staff, 'Neutral')
+        if campus != 'Chưa xác định' and pref != 'Neutral' and pref != campus:
+            travel_count += 1
+
+    results['travel_penalty'] = travel_count
+
+    # -----------------------------------------------------------------
+    # Print results
+    # -----------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  {label}: {filepath}")
+    print(f"{'='*60}")
+    print(f"  1. Total assigned duties        : {results['total_duties']}")
+    print(f"  2. Max workload per invigilator  : {results['max_workload']}")
+    print(f"  3. Min workload per invigilator  : {results['min_workload']}")
+    print(f"     (Ideal workload               : {results['ideal_workload']:.2f})")
+    print(f"  4. Mean abs deviation (MAD)      : {results['mad_workload']:.4f}")
+    print(f"  5. Simultaneous-shift conflicts  : {results['simultaneous_conflicts']}")
+    print(f"  6. Cross-campus consec. conflicts: {results['cross_campus_conflicts']}")
+    print(f"  7. Total fatigue penalty         : {results['fatigue_penalty']}")
+    print(f"  8. Total travel preference penalty: {results['travel_penalty']}")
+    print(f"{'='*60}")
+
+    return results
+
+
+# =====================================================================
+# Main
+# =====================================================================
+if __name__ == '__main__':
+    staff_pref = load_preferences(PROCESSED_JSON)
+
+    baseline = evaluate_schedule(BASELINE_CSV, staff_pref, 'BASELINE')
+    optimized = evaluate_schedule(OPTIMIZED_CSV, staff_pref, 'OPTIMIZED OUTPUT')
+
+    # -----------------------------------------------------------------
+    # Side-by-side comparison table
+    # -----------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("  SIDE-BY-SIDE COMPARISON")
+    print(f"{'='*60}")
+    print(f"  {'Metric':<40} {'Baseline':>10} {'Optimized':>10}")
+    print(f"  {'-'*40} {'-'*10} {'-'*10}")
+
+    rows = [
+        ('Total assigned duties',       'total_duties'),
+        ('Max workload',                'max_workload'),
+        ('Min workload',                'min_workload'),
+        ('MAD from ideal workload',     'mad_workload'),
+        ('Simultaneous-shift conflicts','simultaneous_conflicts'),
+        ('Cross-campus consec. conflicts','cross_campus_conflicts'),
+        ('Total fatigue penalty',       'fatigue_penalty'),
+        ('Total travel pref. penalty',  'travel_penalty'),
+    ]
+
+    for label, key in rows:
+        bval = baseline[key]
+        oval = optimized[key]
+        if isinstance(bval, float):
+            print(f"  {label:<40} {bval:>10.4f} {oval:>10.4f}")
+        else:
+            print(f"  {label:<40} {bval:>10} {oval:>10}")
+solver.py
